@@ -31,6 +31,10 @@ inputs:
     default: 'Playwright'
     options:
       - 'Playwright'
+  validationEnvs:
+    description: 'Additional environment variables for validation, in KEY=VALUE format, separated by commas'
+    required: false
+    default: ''
 outputs:
   resultFile:
     description: "A file path to a results file."
@@ -165,13 +169,118 @@ runs:
     #  env:
     #    AZURE_ENV_NAME: ${{ env.AZURE_ENV_NAME }}
 
+    - name: Check parameters in main.bicep
+      id: check_parameters
+      #if: ${{ inputs.validateAzd == 'true' }}
+      run: |
+        set +e  # Don't exit on errors
+        
+        # Wrap the entire logic in a try-catch equivalent
+        {
+          echo "Starting parameter check process..."
+        
+        if [ -f "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.bicep" ]; then
+          # Get parameter names that don't have a default value (no equals sign in the line)
+          parameters=$(grep -P "^param\s+\w+\s+\w+$" "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.bicep" | grep -oP "^param\s+\K\w+" || echo "")
+          echo "parameters from main.bicep without default value: $parameters"
+          # remove if parameters are set default values in /infra/main.parameters.json. 
+          # The following the sample (no default value) in main.parameters.json: "location": { "value": "${AZURE_LOCATION}" }
+          # The following the sample (with default value) in main.parameters.json: "location": { "value": "${AZURE_LOCATION}=eastus2" }
+          if [ -f "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.parameters.json" ]; then
+            required_env=""
+            for param in $parameters; do
+              echo "Checking parameter: $param"
+              # Check if parameter exists and has no default value
+              param_value=$(jq -r ".parameters."$param".value // empty" "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.parameters.json" || echo "")
+              echo "$param value in parameter json file: $param_value"
+              if [ ! -z "$param_value" ] && [[ "$param_value" =~ ^\$\{[A-Za-z_]+\}$ ]]; then
+                # parse param_value to get the value. e.g get AZURE_LOCATION from "value": "${AZURE_LOCATION}"
+                env_key=$(echo "$param_value" | grep -oP '\$\{([^}]+)\}' | sed 's/\${//;s/}//g' || echo "")
+                echo "$param env_key: $env_key"
+                if [[ $env_key == 'AZURE_LOCATION' || $env_key == 'AZURE_ENV_NAME' || $env_key == 'AZURE_PRINCIPAL_ID' || $env_key == 'AZURE_PRINCIPAL_TYPE' || ${env_key,,} == *"location"* ]]; then
+                  echo "Ignoring parameter: $param"
+                  continue
+                else
+                  # Set env_value with random value (15 characters and starts with a letter)
+                  env_value=$(echo -n $(printf "%c" $(($RANDOM % 26 + 65)))$(for i in {1..14}; do echo -n $(($RANDOM % 36 + 48)) | awk '{printf "%c", ($1 > 57 ? $1 + 39 : $1)}'; done))
+                  # If $env_key contains Capacity (ignore case), set env_value to "10"
+                  if [[ ${env_key,,} == *"capacity"* ]]; then
+                    env_value="10"
+                  elif [[ ${env_key,,} == *"enabled"* ]]; then
+                    env_value="false"
+                  fi
+                  echo "env_value: $env_value"
+                  # Find the nearest @allowed annotation before this parameter
+                  allowed_value=""
+                  # Get the parameter line and check previous lines for @allowed
+                  param_line_num=$(grep -n "^param $param " "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.bicep" | cut -d: -f1 | head -1)
+                  if [ -n "$param_line_num" ]; then
+                    # Look backwards from the parameter line to find the nearest @allowed
+                    start_line=$((param_line_num-1))
+                    end_line=$((param_line_num-10))
+                    if [ $end_line -lt 1 ]; then
+                      end_line=1
+                    fi                    
+                    i=$start_line
+                    while [ $i -ge $end_line ]; do
+                      line=$(sed -n "${i}p" "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.bicep")
+                      if echo "$line" | grep -q "@allowed"; then
+                        allowed_value=$(echo "$line" | grep -oP "@allowed\(\[\K[^\]]+" || echo "")
+                        break
+                      elif echo "$line" | grep -q "^param "; then
+                        # Hit another parameter, stop searching
+                        break
+                      fi
+                      i=$((i-1))
+                    done
+                  fi
+                  if [ -n "$allowed_value" ]; then
+                    echo "Parameter $param has allowed value: $allowed_value"
+                    # Select first element in the allowed list
+                    env_value=$(echo "$allowed_value" | tr -d "'" | tr -d '"' | awk -F, '{print $1}' | xargs)
+                    echo "Using allowed value for $param: $env_value"
+                  fi
+                  echo "Adding to required_env: $env_key=$env_value"
+                  required_env+="$env_key=$env_value "
+                  echo "$env_key=$env_value" >> $GITHUB_ENV
+                fi
+              fi
+            done
+            echo "required_env from json: $required_env"
+          fi
+        else
+          echo "main.bicep not found, skipping parameter check"
+        fi
+        
+        } || {
+          echo "Error occurred during parameter check process: $?"
+          echo "Continuing with validation despite parameter check failure..."
+          exit_code=$?
+        }
+        
+        echo "Parameter check process completed"
+        exit 0  # Always exit successfully
+      shell: bash
+      continue-on-error: true
+
+    - name: Set additional validation environment variables
+      id: set_additional_envs
+      if: ${{ inputs.validateAzd == 'true' && inputs.validationEnvs != '' }}
+      run: |
+        IFS=',' read -ra ADDR <<< "${{ inputs.validationEnvs }}"
+        for env_pair in "${ADDR[@]}"; do
+          echo "$env_pair" >> $GITHUB_ENV
+        done
+      shell: bash
+
     - name: Check and Set targetScope in main.bicep
       id: check_targetScope
       if: ${{ inputs.validateAzd == 'true' }}
       run: |
         if [ -f "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.bicep" ]; then
           # Check if targetScope is set to 'subscription' or 'resourceGroup'. The sample sentence in bicep is: targetScope = 'subscription'
-          targetScope=$(grep -oP "targetScope\s*=\s*['\"]\K[^'\"]+" ${{ steps.reform_path.outputs.workingDirectory }}/infra/main.bicep)
+          targetScope=$(grep -oP "targetScope\s*=\s*['\"]\K[^'\"]+" "${{ steps.reform_path.outputs.workingDirectory }}/infra/main.bicep" 2>/dev/null || echo "")
+          echo "targetScope: $targetScope"
           echo "targetScope=$targetScope" >> $GITHUB_ENV
           if [ "$targetScope" == "subscription" ]; then
             echo "targetScope is set to 'subscription' in main.bicep"
@@ -179,10 +288,13 @@ runs:
           elif [ "$targetScope" == "resourceGroup" ]; then
             echo "targetScope is set to 'resourceGroup' in main.bicep"
           else
-            echo "targetScope is not set to 'subscription' or 'resourceGroup' in main.bicep"
+            echo "targetScope is not set to 'subscription' or 'resourceGroup' in main.bicep, set to 'resourceGroup' by default"
+            targetScope="resourceGroup"
+            echo "targetScope=$targetScope" >> $GITHUB_ENV
           fi
         fi
       shell: bash
+      continue-on-error: true
 
     - name: Set azure resource group name in env
       id: set_resource_group
@@ -293,7 +405,32 @@ runs:
           echo "Install playwright node..."
           npm install @playwright/test
           echo "Install playwright browsers..."
-          npx playwright install --with-deps
+          # Clean up package cache to free space
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          # Check available disk space
+          echo "Available disk space:"
+          df -h /
+          # Install playwright browsers first
+          npx playwright install
+          # Install required system dependencies for Playwright
+          echo "Installing Playwright system dependencies..."
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            libdbus-1-3 \
+            libatk1.0-0t64 \
+            libatk-bridge2.0-0t64 \
+            libcups2t64 \
+            libxkbcommon0 \
+            libatspi2.0-0t64 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libasound2t64 || echo "Some system dependencies could not be installed, but browsers should still work"
+          echo "Playwright browsers and dependencies installed successfully"
+          
         subFolder: ${{ steps.reform_path.outputs.workingDirectory }}
     
     - name: Remove spaces from inputs
@@ -402,10 +539,21 @@ runs:
         CREATE_ROLE_FOR_USER: false
         AZURE_PRINCIPAL_TYPE: "ServicePrincipal"
 
+    - name: Azure CLI script
+      id: delete_resource_group
+      if : ${{ inputs.validateAzd == 'true' && env.targetScope == 'resourceGroup' }}
+      run: |
+        az group delete --resource-group ${{ env.AZURE_RESOURCE_GROUP }} -y || echo "Warning: Failed to delete resource group ${AZURE_RESOURCE_GROUP}, continuing..."
+      shell: bash
+      continue-on-error: true
+
     - id: set_output
       run: |
         if [[ ${{ inputs.useDevContainer }} == 'true' ]]; then
-          echo "${{ steps.send_output.outputs.runCmdOutput }}" >> ${{ github.run_id }}-output.log
+          # Use here-document to safely handle special characters and long content
+          cat << 'VALIDATION_OUTPUT_EOF' >> ${{ github.run_id }}-output.log
+        ${{ steps.send_output.outputs.runCmdOutput }}
+        VALIDATION_OUTPUT_EOF
         fi
         output_link=$(realpath ${{ github.run_id }}-output.log)
         echo "resultFile is $output_link"
